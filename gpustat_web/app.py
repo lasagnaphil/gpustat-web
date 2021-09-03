@@ -7,7 +7,7 @@ MIT License
 Copyright (c) 2018-2020 Jongwook Choi (@wookayin)
 """
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import os
 import sys
 import traceback
@@ -43,7 +43,6 @@ class Context(object):
 
     def host_set_message(self, hostname: str, msg: str):
         self.host_status[hostname] = colored(f"({hostname}) ", 'white') + msg + '\n'
-
 
 context = Context()
 
@@ -110,7 +109,7 @@ async def run_client(hostname: str, exec_cmd: str, *, port=22,
         await asyncio.sleep(poll_delay)
 
 
-async def spawn_clients(hosts: List[str], exec_cmd: str, *,
+async def spawn_clients(config: Dict[str, Tuple[str, int]], *,
                         default_port: int, verbose=False):
     '''Create a set of async handlers, one per host.'''
 
@@ -122,6 +121,7 @@ async def spawn_clients(hosts: List[str], exec_cmd: str, *,
         return (pr.hostname, pr.port)
 
     try:
+        hosts = list(config.keys())
         host_names, host_ports = zip(*(_parse_host_string(host) for host in hosts))
 
         # initial response
@@ -132,9 +132,9 @@ async def spawn_clients(hosts: List[str], exec_cmd: str, *,
 
         # launch all clients parallel
         await asyncio.gather(*[
-            run_client(hostname, exec_cmd, port=port or default_port,
+            run_client(hostname, command, port=port,
                     verbose=verbose, name_length=name_length)
-            for (hostname, port) in zip(host_names, host_ports)
+            for hostname, (command, port) in config.items()
         ])
     except Exception as ex:
         # TODO: throw the exception outside and let aiohttp abort startup
@@ -158,7 +158,7 @@ def render_gpustat_body():
     body = ''
     for host, status in context.host_status.items():
         if not status:
-            continue
+             continue
         body += status
     return ansi_conv.convert(body, full=False)
 
@@ -206,22 +206,17 @@ async def websocket_handler(request):
 ###############################################################################
 
 def create_app(loop, *,
-               hosts=['localhost'],
-               default_port: int = 22,
+               config: Dict[str, Tuple[str, int]],
+               ssh_port: Optional[int] = 22,
                ssl_certfile: Optional[str] = None,
                ssl_keyfile: Optional[str] = None,
-               exec_cmd: Optional[str] = None,
                verbose=True):
-    if not exec_cmd:
-        exec_cmd = DEFAULT_GPUSTAT_COMMAND
-
     app = web.Application()
     app.router.add_get('/', handler)
     app.add_routes([web.get('/ws', websocket_handler)])
 
     async def start_background_tasks(app):
-        clients = spawn_clients(
-            hosts, exec_cmd, default_port=default_port, verbose=verbose)
+        clients = spawn_clients(config, default_port=ssh_port, verbose=verbose)
         app['tasks'] = loop.create_task(clients)
         await asyncio.sleep(0.1)
     app.on_startup.append(start_background_tasks)
@@ -269,20 +264,30 @@ def main():
     parser.add_argument('--exec', type=str,
                         default=DEFAULT_GPUSTAT_COMMAND,
                         help="command-line to execute (e.g. gpustat --color --gpuname-width 25)")
+    parser.add_argument('--exec-config-file', type=str, default=None,
+                        help="Config file that contains the list of command-line to execute for each host")
     args = parser.parse_args()
-
-    hosts = args.hosts or ['localhost']
-    cprint(f"Hosts : {hosts}", color='green')
-    cprint(f"Cmd   : {args.exec}", color='yellow')
 
     if args.interval > 0.1:
         context.interval = args.interval
 
+    config = dict()
+    if args.exec_config_file:
+        import json
+        with open(args.exec_config_file, 'r') as f:
+            config_json = json.load(f)
+        default_cmd = config_json["default"]["command"]
+        default_port = config_json["default"]["port"]
+        hosts = [host for host in config_json if host != "default"]
+        for host in hosts:
+            command = config_json[host].get("command", default_cmd)
+            port = int(config_json[host].get("port", default_port))
+            config[host] = (command, port)
+
     loop = asyncio.get_event_loop()
     app, ssl_context = create_app(
-        loop, hosts=hosts, default_port=args.ssh_port,
+        loop, config=config, ssh_port=args.ssh_port,
         ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile,
-        exec_cmd=args.exec,
         verbose=args.verbose)
 
     web.run_app(app, host='0.0.0.0', port=args.port,
